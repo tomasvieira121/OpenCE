@@ -38,6 +38,14 @@ SDL_URL = (
 THIRD_PARTY = BUILD / "third_party"
 SDL_DIR = THIRD_PARTY / f"SDL3-{SDL_VERSION}"
 
+OPENAL_VERSION = "1.24.2"
+OPENAL_URL = (
+    f"https://github.com/kcat/openal-soft/releases/download/{OPENAL_VERSION}/"
+    f"openal-soft-{OPENAL_VERSION}-bin.zip"
+)
+OPENAL_DIR = THIRD_PARTY / f"openal-soft-{OPENAL_VERSION}-bin"
+
+
 # Flags shared by every unit. The Microsoft target gives the game the ABI it
 # was written against natively: 16-bit wchar_t, MSVC structure layout,
 # __declspec, calling conventions and COMDAT inline functions.
@@ -159,6 +167,25 @@ def fetch_sdl() -> None:
     archive.unlink()
 
 
+def fetch_openal() -> None:
+    """Downloads or extracts OpenAL Soft (Win32 soft_oal.dll and headers) once."""
+    if (OPENAL_DIR / "bin" / "Win32" / "soft_oal.dll").is_file():
+        return
+    THIRD_PARTY.mkdir(parents=True, exist_ok=True)
+    local_zip = Path("openal.zip")
+    if local_zip.is_file():
+        with zipfile.ZipFile(local_zip) as z:
+            z.extractall(THIRD_PARTY)
+        return
+    archive = THIRD_PARTY / f"openal-soft-{OPENAL_VERSION}-bin.zip"
+    print(f"Downloading {OPENAL_URL}")
+    with urllib.request.urlopen(OPENAL_URL) as response, open(archive, "wb") as f:
+        shutil.copyfileobj(response, f)
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(THIRD_PARTY)
+    archive.unlink()
+
+
 # The runtime of instrumented builds (-fprofile-generate), which LLVM for
 # Windows ships only for x86-64: its C sources, from the LLVM release of the
 # compiler that uses them, built for the 32-bit game.
@@ -243,8 +270,9 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
         return
     try:
         fetch_sdl()
+        fetch_openal()
     except OSError as error:
-        print(f"Windows build disabled: cannot fetch SDL3 ({error})", file=sys.stderr)
+        print(f"Windows build disabled: cannot fetch dependencies ({error})", file=sys.stderr)
         return
     linux_config: Dict[str, Any] = json.loads((LINUX_DIR / "port.json").read_text(encoding="utf-8"))
     config = _load_config()
@@ -253,6 +281,7 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     obj_dir = BUILD / "obj"
     output = BUILD / "halo.exe"
     sdl_dll = BUILD / "SDL3.dll"
+    openal_dll = BUILD / "soft_oal.dll"
     cc = getattr(sln, "windows_cc", None) or "clang"
     prefix_header = PORT_DIR / "include" / "halo_windows_prefix.h"
     crt_include = PORT_DIR / "include" / "crt"
@@ -368,6 +397,7 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
             f"-I{crt_include}",
             f"-I{linux_platform}",
             f"-I{PORT_DIR / 'include'}",
+            f"-I{Path('port/include')}",
             f"-I{TOML_DIR}",
             f"-I{EXPAT_DIR}",
             f"-I{KCP_DIR}",
@@ -486,8 +516,11 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     emit(obj_dir, output, lto_cflags + profile_use_flags(profile),
          lto_cflags + [OPTIMISATION] if lto_cflags else [], [], [profile] if profile else [])
     n.build(outputs=sdl_dll, rule="windows_copy", inputs=SDL_DIR / "lib" / "x86" / "SDL3.dll")
+    openal_src = OPENAL_DIR / "bin" / "Win32" / "soft_oal.dll"
+    if openal_src.is_file():
+        n.build(outputs=openal_dll, rule="windows_copy", inputs=openal_src)
     # internet play's MQTT brokers, a file beside the game (network.brokers_file)
     brokers = BUILD / "brokers.txt"
     n.build(outputs=brokers, rule="windows_copy", inputs=Path("port/assets/network/brokers.txt"))
-    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, brokers])
+    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, openal_dll, brokers])
     n.newline()
