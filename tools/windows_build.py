@@ -38,7 +38,7 @@ SDL_URL = (
 THIRD_PARTY = BUILD / "third_party"
 SDL_DIR = THIRD_PARTY / f"SDL3-{SDL_VERSION}"
 
-OPENAL_VERSION = "1.24.2"
+OPENAL_VERSION = "1.25.2"
 OPENAL_URL = (
     f"https://github.com/kcat/openal-soft/releases/download/{OPENAL_VERSION}/"
     f"openal-soft-{OPENAL_VERSION}-bin.zip"
