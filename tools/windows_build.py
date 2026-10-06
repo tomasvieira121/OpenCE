@@ -175,15 +175,10 @@ def fetch_sdl() -> None:
 
 
 def fetch_openal() -> None:
-    """Downloads or extracts OpenAL Soft (Win32 soft_oal.dll and headers) once."""
+    """Downloads OpenAL Soft (Win32 soft_oal.dll and headers) once."""
     if (OPENAL_DIR / "bin" / "Win32" / "soft_oal.dll").is_file():
         return
     THIRD_PARTY.mkdir(parents=True, exist_ok=True)
-    local_zip = Path("openal.zip")
-    if local_zip.is_file():
-        with zipfile.ZipFile(local_zip) as z:
-            z.extractall(THIRD_PARTY)
-        return
     archive = THIRD_PARTY / f"openal-soft-{OPENAL_VERSION}-bin.zip"
     print(f"Downloading {OPENAL_URL}")
     with urllib.request.urlopen(OPENAL_URL) as response, open(archive, "wb") as f:
