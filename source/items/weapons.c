@@ -1956,7 +1956,8 @@ static long weapon_effect_new(
 			
 			if (group_tag==SOUND_DEFINITION_TAG)
 			{
-				object_impulse_sound_new(object_index, effect_index, NONE, global_origin3d, global_forward3d, effect_scale);
+				/* Use the weapon index to make a sound effect. Do not use the effect index. */
+				object_impulse_sound_new(weapon_index, effect_index, NONE, global_origin3d, global_forward3d, effect_scale);
 				result = NONE;
 			}
 		}

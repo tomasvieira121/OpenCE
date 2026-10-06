@@ -75,6 +75,10 @@ void first_person_weapon_message_from_weapon(
 struct real_matrix4x3 *first_person_weapon_get_node_matrix(
 	short local_player_index,
 	short node_index);
+short first_person_weapon_index_from_weapon_index(
+	long weapon_index);
+short first_person_weapon_index_from_unit_index(
+	long unit_index);
 
 /* ---------- globals */
 

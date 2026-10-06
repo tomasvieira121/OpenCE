@@ -370,9 +370,9 @@ static void model_remap_node_matrices_to_match_animation_graph(
 	short const *node_remapping_table);
 static struct first_person_weapon *first_person_weapon_get(
 	short local_player_index);
-static short first_person_weapon_index_from_weapon_index(
+short first_person_weapon_index_from_weapon_index(
 	long weapon_index);
-static short first_person_weapon_index_from_unit_index(
+short first_person_weapon_index_from_unit_index(
 	long unit_index);
 
 /* port/linux/game/pal_tags.c's */
@@ -785,10 +785,10 @@ struct real_matrix4x3 *first_person_weapon_get_node_matrix(
 	weapon_definition = weapon_definition_get(weapon->definition_index);
 	animation_graph = animation_graph_definition_get(
 		weapon_definition->weapon.interface_definition.first_person_animations.index);
-	match_assert(
-		"c:\\halo\\SOURCE\\interface\\first_person_weapons.c",
-		718,
-		node_index>=0 && node_index<animation_graph->nodes.count);
+	if (node_index < 0 || node_index >= animation_graph->nodes.count)
+	{
+		node_index = 0;
+	}
 
 	return &first_person_weapon->node_matrices[node_index];
 }
@@ -2277,7 +2277,7 @@ static struct first_person_weapon *first_person_weapon_get(
 	return &first_person_weapons[local_player_index];
 }
 
-static short first_person_weapon_index_from_weapon_index(
+short first_person_weapon_index_from_weapon_index(
 	long weapon_index)
 {
 	short local_player_index;
@@ -2306,7 +2306,7 @@ static short first_person_weapon_index_from_weapon_index(
 	return NONE;
 }
 
-static short first_person_weapon_index_from_unit_index(
+short first_person_weapon_index_from_unit_index(
 	long unit_index)
 {
 	short local_player_index;

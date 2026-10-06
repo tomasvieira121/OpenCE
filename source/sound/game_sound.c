@@ -107,6 +107,8 @@ symbols in this file:
 #include "physics/collisions.h"
 #include "physics/collision_usage.h"
 #include "saved games/game_state.h"
+#include "camera/director.h"
+#include "interface/first_person_weapons.h"
 #include "scenario/scenario.h"
 #include "sound/game_sound.h"
 #include "sound/sound_classes.h"
@@ -416,6 +418,43 @@ void game_looping_sound_delete(
 	return;
 }
 
+/* Find the first-person player index for the sound object. */
+static short get_first_person_local_player_for_sound(
+	long object_index,
+	long definition_index)
+{
+	short local_player_index = NONE;
+
+	if (object_index != NONE && definition_index != NONE)
+	{
+		local_player_index = first_person_weapon_index_from_weapon_index(object_index);
+		if (local_player_index == NONE)
+		{
+			local_player_index = first_person_weapon_index_from_unit_index(object_index);
+		}
+
+		if (local_player_index != NONE)
+		{
+			if (director_get_perspective(local_player_index) != _director_perspective_first_person)
+			{
+				return NONE;
+			}
+
+			struct sound_definition *definition = sound_definition_get(definition_index);
+			if (definition)
+			{
+				short sclass = definition->sound_class;
+				if ((sclass >= 4 && sclass <= 10) || sclass == 40)
+				{
+					return local_player_index;
+				}
+			}
+		}
+	}
+
+	return NONE;
+}
+
 long object_impulse_sound_new(
 	long object_index,
 	long definition_index,
@@ -437,22 +476,52 @@ long object_impulse_sound_new(
 		302,
 		scale>=0.f && scale<=1.f);
 
-	attachment_data.position = *position;
-	attachment_data.forward = *forward;
-	source.spatialization_mode = _sound_spatialization_mode_absolute;
-	source.gain = 1.f;
-	attachment_data.node_index = node_index;
-	source.location.game_location.cluster_index = NONE;
-	if (track_object_impulse_sound(object_index, &attachment_data, &source))
+	short fp_player_index = get_first_person_local_player_for_sound(object_index, definition_index);
+	if (fp_player_index != NONE)
 	{
+		/* Set the relative mode for first-person weapon sounds. */
+		source.spatialization_mode = _sound_spatialization_mode_relative;
+		source.location.position.x = 0.35f;
+		source.location.position.y = -0.15f;
+		source.location.position.z = -0.12f;
+		source.location.forward.i = 1.0f;
+		source.location.forward.j = 0.0f;
+		source.location.forward.k = 0.0f;
+		source.location.translational_velocity.i = 0.0f;
+		source.location.translational_velocity.j = 0.0f;
+		source.location.translational_velocity.k = 0.0f;
+		source.location.game_location.cluster_index = NONE;
+		source.gain = 1.f;
 		source.scale = scale;
+
 		sound_index = sound_new_impulse(
 			definition_index,
 			&source,
 			object_index,
-			track_object_impulse_sound,
-			&attachment_data,
-			sizeof(attachment_data));
+			NULL,
+			NULL,
+			0);
+	}
+	else
+	{
+		/* Set the absolute mode for other sounds. */
+		attachment_data.position = *position;
+		attachment_data.forward = *forward;
+		source.spatialization_mode = _sound_spatialization_mode_absolute;
+		source.gain = 1.f;
+		attachment_data.node_index = node_index;
+		source.location.game_location.cluster_index = NONE;
+		if (track_object_impulse_sound(object_index, &attachment_data, &source))
+		{
+			source.scale = scale;
+			sound_index = sound_new_impulse(
+				definition_index,
+				&source,
+				object_index,
+				track_object_impulse_sound,
+				&attachment_data,
+				sizeof(attachment_data));
+		}
 	}
 
 	return sound_index;
@@ -1159,6 +1228,7 @@ boolean track_object_impulse_sound(
 			node_matrix = object_get_node_matrix(
 				object_index,
 				attachment->node_index == NONE ? 0 : attachment->node_index);
+
 			source->location.game_location = location;
 			matrix4x3_transform_point(
 				node_matrix,
@@ -1212,22 +1282,44 @@ static void update_potentially_audible_looping_sound(
 	{
 		if (sound->object_index != NONE)
 		{
-			real_matrix4x3 const *node_matrix = object_get_node_matrix(
-				sound->object_index,
-				sound->node_index);
+			short local_player_index = first_person_weapon_index_from_weapon_index(sound->object_index);
 
-			match_assert(
-				"c:\\halo\\SOURCE\\sound\\game_sound.c",
-				619,
-				location);
-			matrix4x3_transform_point(node_matrix, &sound->position, &source.location.position);
-			matrix4x3_transform_normal(node_matrix, &sound->forward, &source.location.forward);
-			object_get_velocities(
-				sound->object_index,
-				&source.location.translational_velocity,
-				&unused_velocity);
-			source.location.game_location = *location;
-			source.spatialization_mode = _sound_spatialization_mode_absolute;
+			if (local_player_index != NONE &&
+				director_get_perspective(local_player_index) == _director_perspective_first_person)
+			{
+				/* Set the relative mode for first-person looping sounds. */
+				source.location.position.x = 0.35f;
+				source.location.position.y = -0.15f;
+				source.location.position.z = -0.12f;
+				source.location.forward.i = 1.0f;
+				source.location.forward.j = 0.0f;
+				source.location.forward.k = 0.0f;
+				source.location.translational_velocity.i = 0.0f;
+				source.location.translational_velocity.j = 0.0f;
+				source.location.translational_velocity.k = 0.0f;
+				source.location.game_location.cluster_index = NONE;
+				source.spatialization_mode = _sound_spatialization_mode_relative;
+			}
+			else
+			{
+				/* Set the absolute mode for other looping sounds. */
+				real_matrix4x3 const *node_matrix = object_get_node_matrix(
+					sound->object_index,
+					sound->node_index);
+
+				match_assert(
+					"c:\\halo\\SOURCE\\sound\\game_sound.c",
+					619,
+					location);
+				matrix4x3_transform_point(node_matrix, &sound->position, &source.location.position);
+				matrix4x3_transform_normal(node_matrix, &sound->forward, &source.location.forward);
+				object_get_velocities(
+					sound->object_index,
+					&source.location.translational_velocity,
+					&unused_velocity);
+				source.location.game_location = *location;
+				source.spatialization_mode = _sound_spatialization_mode_absolute;
+			}
 		}
 		else
 		{
