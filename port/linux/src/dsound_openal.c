@@ -52,7 +52,6 @@ static void* (ALCAPIENTRY *palcGetProcAddress)(ALCdevice *device, const ALCchar 
 static ALCenum (ALCAPIENTRY *palcGetError)(ALCdevice *device);
 static const ALCchar* (ALCAPIENTRY *palcGetString)(ALCdevice *device, ALCenum param);
 static void (ALCAPIENTRY *palcGetIntegerv)(ALCdevice *device, ALCenum param, ALCsizei size, ALCint *values);
-static LPALCRESETDEVICESOFT palcResetDeviceSOFT;
 
 /* AL core functions */
 static void (ALAPIENTRY *palGenSources)(ALsizei n, ALuint *sources);
@@ -106,6 +105,8 @@ static ALCdevice *al_device = NULL;
 static ALCcontext *al_context = NULL;
 static boolean al_active = FALSE;
 static boolean has_efx = FALSE;
+static boolean has_source_spatialize = FALSE;
+static boolean has_direct_channels = FALSE;
 static ALuint global_reverb_effect = 0;
 static ALuint global_reverb_slot = 0;
 
@@ -141,6 +142,10 @@ struct al_stream
 	ALuint source;
 	ALuint direct_filter;     /* Low-pass filter for obstruction / occlusion */
 	BOOL has_direct_filter;
+	float filter_gain;
+	float filter_gain_hf;
+	BOOL filter_dirty;
+	BOOL dirty;
 
 	/* 2D mixing */
 	float volume;
@@ -180,7 +185,13 @@ static struct
 	float top[3];
 	float rolloff_factor;
 	float distance_factor;
-} listener = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 }, 1.0f, 1.0f };
+	BOOL dirty_pos;
+	BOOL dirty_vel;
+	BOOL dirty_ori;
+} listener = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 1 }, { 0, 1, 0 }, 1.0f, 1.0f, FALSE, FALSE, FALSE };
+
+static DSI3DL2LISTENER cached_i3dl2_listener;
+static BOOL i3dl2_listener_dirty = FALSE;
 
 static float master_volume = 1.0f;
 
@@ -318,6 +329,11 @@ static void update_source_properties(struct al_stream *stream)
 	/* 3D vs 2D */
 	if (stream->has_3d && stream->mode != DS3DMODE_DISABLE)
 	{
+		if (has_source_spatialize)
+			palSourcei(stream->source, AL_SOURCE_SPATIALIZE_SOFT, AL_TRUE);
+		if (has_direct_channels)
+			palSourcei(stream->source, AL_DIRECT_CHANNELS_SOFT, AL_FALSE);
+
 		palSourcei(stream->source, AL_SOURCE_RELATIVE, (stream->mode == DS3DMODE_HEADRELATIVE) ? AL_TRUE : AL_FALSE);
 		/* Convert DirectSound LH (+Z fwd) to OpenAL RH (-Z fwd) */
 		palSource3f(stream->source, AL_POSITION, stream->position[0], stream->position[1], -stream->position[2]);
@@ -343,12 +359,18 @@ static void update_source_properties(struct al_stream *stream)
 	}
 	else
 	{
-		/* 2D voice */
+		/* 2D voice: do not apply HRTF spatialization to non-diegetic sounds (UI, HUD, dialogue) */
+		if (has_source_spatialize)
+			palSourcei(stream->source, AL_SOURCE_SPATIALIZE_SOFT, AL_FALSE);
+
 		palSourcei(stream->source, AL_SOURCE_RELATIVE, AL_TRUE);
 		palSourcef(stream->source, AL_ROLLOFF_FACTOR, 0.0f);
 
 		if (stream->channels == 1)
 		{
+			if (has_direct_channels)
+				palSourcei(stream->source, AL_DIRECT_CHANNELS_SOFT, AL_FALSE);
+
 			/* Pan mono voices across left/right bins */
 			float total = stream->mix_left + stream->mix_right;
 			float pan = total > 1.0e-4f ? (stream->mix_right - stream->mix_left) / total : 0.0f;
@@ -358,11 +380,29 @@ static void update_source_properties(struct al_stream *stream)
 		}
 		else
 		{
-			/* Stereo voices pass through unspatialized */
+			/* Stereo voices (music, cutscenes) pass through directly without crossfeed or downmixing */
+			if (has_direct_channels)
+				palSourcei(stream->source, AL_DIRECT_CHANNELS_SOFT, AL_TRUE);
+
 			float gain = fmaxf(stream->mix_left, stream->mix_right) * stream->volume;
 			palSource3f(stream->source, AL_POSITION, 0.0f, 0.0f, 0.0f);
 			palSourcef(stream->source, AL_GAIN, gain);
 		}
+	}
+
+	/* EFX direct low-pass filter for obstruction / occlusion */
+	if (has_efx && stream->filter_dirty)
+	{
+		if (!stream->has_direct_filter)
+		{
+			palGenFilters(1, &stream->direct_filter);
+			palFilteri(stream->direct_filter, AL_FILTER_TYPE, AL_FILTER_LOWPASS);
+			stream->has_direct_filter = TRUE;
+		}
+		palFilterf(stream->direct_filter, AL_LOWPASS_GAIN, stream->filter_gain);
+		palFilterf(stream->direct_filter, AL_LOWPASS_GAINHF, stream->filter_gain_hf);
+		palSourcei(stream->source, AL_DIRECT_FILTER, stream->direct_filter);
+		stream->filter_dirty = FALSE;
 	}
 }
 
@@ -590,21 +630,7 @@ static void audio_start(void)
 		return;
 	}
 
-	/* HRTF Configuration */
-	boolean has_hrtf_ext = palcIsExtensionPresent(al_device, "ALC_SOFT_HRTF");
-	boolean hrtf_requested = config_boolean("audio.hrtf");
-	ALCint attrs[16];
-	int attr_idx = 0;
-
-	if (has_hrtf_ext)
-	{
-		attrs[attr_idx++] = ALC_HRTF_SOFT;
-		attrs[attr_idx++] = hrtf_requested ? ALC_TRUE : ALC_FALSE;
-		palcResetDeviceSOFT = (LPALCRESETDEVICESOFT)palcGetProcAddress(al_device, "alcResetDeviceSOFT");
-	}
-	attrs[attr_idx] = 0;
-
-	al_context = palcCreateContext(al_device, attr_idx > 0 ? attrs : NULL);
+	al_context = palcCreateContext(al_device, NULL);
 	if (!al_context)
 	{
 		platform_log("OpenAL: failed to create context");
@@ -619,17 +645,37 @@ static void audio_start(void)
 	palcMakeContextCurrent(al_context);
 	al_active = TRUE;
 
-	if (has_hrtf_ext)
+	/* Log HRTF status from OpenAL Soft configuration (alsoft.ini) */
+	if (palcIsExtensionPresent(al_device, "ALC_SOFT_HRTF"))
 	{
 		ALCint hrtf_status = 0;
 		palcGetIntegerv(al_device, ALC_HRTF_STATUS_SOFT, 1, &hrtf_status);
-		platform_log("OpenAL Soft HRTF: status=%d (requested=%d)", hrtf_status, hrtf_requested);
+		const char *status_str = "unknown";
+		switch (hrtf_status)
+		{
+		case ALC_HRTF_DISABLED_SOFT: status_str = "disabled"; break;
+		case ALC_HRTF_ENABLED_SOFT: status_str = "enabled"; break;
+		case ALC_HRTF_DENIED_SOFT: status_str = "denied"; break;
+		case ALC_HRTF_REQUIRED_SOFT: status_str = "required"; break;
+		case ALC_HRTF_HEADPHONES_DETECTED_SOFT: status_str = "headphones detected"; break;
+		case ALC_HRTF_UNSUPPORTED_FORMAT_SOFT: status_str = "unsupported format"; break;
+		}
+		const char *specifier = palcGetString(al_device, ALC_HRTF_SPECIFIER_SOFT);
+		platform_log("OpenAL Soft HRTF: status=%s (%d)%s%s", status_str, hrtf_status,
+			specifier ? ", specifier=" : "", specifier ? specifier : "");
 	}
+
+	has_source_spatialize = palIsExtensionPresent("AL_SOFT_source_spatialize");
+	has_direct_channels = palIsExtensionPresent("AL_SOFT_direct_channels");
+	if (has_source_spatialize)
+		platform_log("OpenAL Soft: AL_SOFT_source_spatialize supported");
+	if (has_direct_channels)
+		platform_log("OpenAL Soft: AL_SOFT_direct_channels supported");
 
 	/* Distance model matching DirectSound inverse distance with max clamp */
 	palDistanceModel(AL_INVERSE_DISTANCE_CLAMPED);
 	palDopplerFactor(1.0f);
-	palSpeedOfSound(343.3f);
+	palSpeedOfSound(343.3f / (listener.distance_factor > 0.0f ? listener.distance_factor : 1.0f));
 	palListenerf(AL_GAIN, master_volume);
 
 	/* Check EFX extension for environmental reverb and obstruction/occlusion filters */
@@ -998,14 +1044,7 @@ restart:
 
 VOID WINAPI DirectSoundUseFullHRTF(void)
 {
-	pthread_mutex_lock(&stream_lock);
-	if (al_active && al_device && palcResetDeviceSOFT)
-	{
-		ALCint attrs[] = { ALC_HRTF_SOFT, ALC_TRUE, 0 };
-		palcResetDeviceSOFT(al_device, attrs);
-		platform_log("DirectSoundUseFullHRTF: HRTF enabled via OpenAL Soft");
-	}
-	pthread_mutex_unlock(&stream_lock);
+	/* OpenAL Soft configuration is controlled via alsoft.ini; do not override user config. */
 }
 
 HRESULT WINAPI IDirectSound_GetCaps(LPDIRECTSOUND sound, LPDSCAPS caps)
@@ -1035,16 +1074,8 @@ HRESULT WINAPI IDirectSound_DownloadEffectsImage(LPDIRECTSOUND sound, LPCVOID im
 	return DS_OK;
 }
 
-HRESULT WINAPI IDirectSound_CommitDeferredSettings(LPDIRECTSOUND sound) { (void)sound; return DS_OK; }
-HRESULT WINAPI IDirectSound_SetMixBinHeadroom(LPDIRECTSOUND sound, DWORD mix_bin_mask, DWORD headroom) { (void)sound; (void)mix_bin_mask; (void)headroom; return DS_OK; }
-
-HRESULT WINAPI IDirectSound_SetI3DL2Listener(LPDIRECTSOUND sound, LPCDSI3DL2LISTENER props, DWORD apply)
+static void apply_i3dl2_listener_locked(const DSI3DL2LISTENER *props)
 {
-	(void)sound; (void)apply;
-	if (!props)
-		return DS_OK;
-
-	pthread_mutex_lock(&stream_lock);
 	if (al_active && has_efx && global_reverb_effect && global_reverb_slot)
 	{
 		palEffectf(global_reverb_effect, AL_REVERB_GAIN, clampf(gain_from_millibels(props->lRoom), 0.0f, 1.0f));
@@ -1060,6 +1091,70 @@ HRESULT WINAPI IDirectSound_SetI3DL2Listener(LPDIRECTSOUND sound, LPCDSI3DL2LIST
 		palEffectf(global_reverb_effect, AL_REVERB_DENSITY, clampf(props->flDensity / 100.0f, 0.0f, 1.0f));
 		palAuxiliaryEffectSloti(global_reverb_slot, AL_EFFECTSLOT_EFFECT, global_reverb_effect);
 	}
+}
+
+HRESULT WINAPI IDirectSound_CommitDeferredSettings(LPDIRECTSOUND sound)
+{
+	(void)sound;
+	pthread_mutex_lock(&stream_lock);
+	if (al_active)
+	{
+		if (listener.dirty_pos)
+		{
+			palListener3f(AL_POSITION, listener.position[0], listener.position[1], -listener.position[2]);
+			listener.dirty_pos = FALSE;
+		}
+		if (listener.dirty_vel)
+		{
+			palListener3f(AL_VELOCITY, listener.velocity[0], listener.velocity[1], -listener.velocity[2]);
+			listener.dirty_vel = FALSE;
+		}
+		if (listener.dirty_ori)
+		{
+			ALfloat orientation[6] = {
+				listener.front[0], listener.front[1], -listener.front[2],
+				listener.top[0],   listener.top[1],   -listener.top[2]
+			};
+			palListenerfv(AL_ORIENTATION, orientation);
+			listener.dirty_ori = FALSE;
+		}
+		if (i3dl2_listener_dirty)
+		{
+			apply_i3dl2_listener_locked(&cached_i3dl2_listener);
+			i3dl2_listener_dirty = FALSE;
+		}
+		for (struct al_stream *stream = streams; stream; stream = stream->next)
+		{
+			if (stream->dirty)
+			{
+				update_source_properties(stream);
+				stream->dirty = FALSE;
+			}
+		}
+	}
+	pthread_mutex_unlock(&stream_lock);
+	return DS_OK;
+}
+
+HRESULT WINAPI IDirectSound_SetMixBinHeadroom(LPDIRECTSOUND sound, DWORD mix_bin_mask, DWORD headroom) { (void)sound; (void)mix_bin_mask; (void)headroom; return DS_OK; }
+
+HRESULT WINAPI IDirectSound_SetI3DL2Listener(LPDIRECTSOUND sound, LPCDSI3DL2LISTENER props, DWORD apply)
+{
+	(void)sound;
+	if (!props)
+		return DS_OK;
+
+	pthread_mutex_lock(&stream_lock);
+	cached_i3dl2_listener = *props;
+	if (apply == DS3D_DEFERRED)
+	{
+		i3dl2_listener_dirty = TRUE;
+	}
+	else
+	{
+		apply_i3dl2_listener_locked(props);
+		i3dl2_listener_dirty = FALSE;
+	}
 	pthread_mutex_unlock(&stream_lock);
 	return DS_OK;
 }
@@ -1069,16 +1164,23 @@ HRESULT WINAPI IDirectSound_SetDistanceFactor(LPDIRECTSOUND sound, FLOAT factor,
 	(void)sound; (void)apply;
 	pthread_mutex_lock(&stream_lock);
 	listener.distance_factor = factor > 0.0f ? factor : 1.0f;
+	if (al_active && palSpeedOfSound)
+		palSpeedOfSound(343.3f / listener.distance_factor);
 	pthread_mutex_unlock(&stream_lock);
 	return DS_OK;
 }
 
 HRESULT WINAPI IDirectSound_SetRolloffFactor(LPDIRECTSOUND sound, FLOAT factor, DWORD apply)
 {
-	(void)sound; (void)apply;
+	(void)sound;
 	pthread_mutex_lock(&stream_lock);
 	listener.rolloff_factor = factor >= 0.0f ? factor : 1.0f;
-	if (al_active)
+	if (apply == DS3D_DEFERRED)
+	{
+		for (struct al_stream *stream = streams; stream; stream = stream->next)
+			stream->dirty = TRUE;
+	}
+	else if (al_active)
 	{
 		for (struct al_stream *stream = streams; stream; stream = stream->next)
 			update_source_properties(stream);
@@ -1089,26 +1191,40 @@ HRESULT WINAPI IDirectSound_SetRolloffFactor(LPDIRECTSOUND sound, FLOAT factor, 
 
 HRESULT WINAPI IDirectSound_SetPosition(LPDIRECTSOUND sound, FLOAT x, FLOAT y, FLOAT z, DWORD apply)
 {
-	(void)sound; (void)apply;
+	(void)sound;
 	pthread_mutex_lock(&stream_lock);
 	listener.position[0] = x;
 	listener.position[1] = y;
 	listener.position[2] = z;
-	if (al_active)
+	if (apply == DS3D_DEFERRED)
+	{
+		listener.dirty_pos = TRUE;
+	}
+	else if (al_active)
+	{
 		palListener3f(AL_POSITION, x, y, -z);
+		listener.dirty_pos = FALSE;
+	}
 	pthread_mutex_unlock(&stream_lock);
 	return DS_OK;
 }
 
 HRESULT WINAPI IDirectSound_SetVelocity(LPDIRECTSOUND sound, FLOAT x, FLOAT y, FLOAT z, DWORD apply)
 {
-	(void)sound; (void)apply;
+	(void)sound;
 	pthread_mutex_lock(&stream_lock);
 	listener.velocity[0] = x;
 	listener.velocity[1] = y;
 	listener.velocity[2] = z;
-	if (al_active)
+	if (apply == DS3D_DEFERRED)
+	{
+		listener.dirty_vel = TRUE;
+	}
+	else if (al_active)
+	{
 		palListener3f(AL_VELOCITY, x, y, -z);
+		listener.dirty_vel = FALSE;
+	}
 	pthread_mutex_unlock(&stream_lock);
 	return DS_OK;
 }
@@ -1116,7 +1232,7 @@ HRESULT WINAPI IDirectSound_SetVelocity(LPDIRECTSOUND sound, FLOAT x, FLOAT y, F
 HRESULT WINAPI IDirectSound_SetOrientation(LPDIRECTSOUND sound, FLOAT x_front, FLOAT y_front, FLOAT z_front,
 	FLOAT x_top, FLOAT y_top, FLOAT z_top, DWORD apply)
 {
-	(void)sound; (void)apply;
+	(void)sound;
 	pthread_mutex_lock(&stream_lock);
 	listener.front[0] = x_front;
 	listener.front[1] = y_front;
@@ -1127,13 +1243,18 @@ HRESULT WINAPI IDirectSound_SetOrientation(LPDIRECTSOUND sound, FLOAT x_front, F
 	normalize3(listener.front);
 	normalize3(listener.top);
 
-	if (al_active)
+	if (apply == DS3D_DEFERRED)
+	{
+		listener.dirty_ori = TRUE;
+	}
+	else if (al_active)
 	{
 		ALfloat orientation[6] = {
 			listener.front[0], listener.front[1], -listener.front[2],
 			listener.top[0],   listener.top[1],   -listener.top[2]
 		};
 		palListenerfv(AL_ORIENTATION, orientation);
+		listener.dirty_ori = FALSE;
 	}
 	pthread_mutex_unlock(&stream_lock);
 	return DS_OK;
@@ -1171,6 +1292,8 @@ HRESULT WINAPI IDirectSound_CreateSoundStream(LPDIRECTSOUND sound, LPCDSSTREAMDE
 	stream->cone_orientation[0] = 0.0f;
 	stream->cone_orientation[1] = 0.0f;
 	stream->cone_orientation[2] = 1.0f;
+	stream->filter_gain = 1.0f;
+	stream->filter_gain_hf = 1.0f;
 
 	pthread_mutex_lock(&stream_lock);
 	if (al_active)
@@ -1210,6 +1333,20 @@ unsigned long __stdcall DirectSoundGetStreamVoiceStatus(LPDIRECTSOUNDSTREAM stre
 	pthread_mutex_lock(&stream_lock); \
 	body; \
 	update_source_properties(record); \
+	pthread_mutex_unlock(&stream_lock); \
+	return DS_OK;
+
+#define STREAM_SETTER_APPLY(body, apply) \
+	struct al_stream *record = stream_from_interface(stream); \
+	pthread_mutex_lock(&stream_lock); \
+	body; \
+	if ((apply) == DS3D_DEFERRED) \
+		record->dirty = TRUE; \
+	else \
+	{ \
+		update_source_properties(record); \
+		record->dirty = FALSE; \
+	} \
 	pthread_mutex_unlock(&stream_lock); \
 	return DS_OK;
 
@@ -1253,56 +1390,47 @@ HRESULT WINAPI IDirectSoundStream_SetMixBinVolumes(LPDIRECTSOUNDSTREAM stream, D
 
 HRESULT WINAPI IDirectSoundStream_SetMode(LPDIRECTSOUNDSTREAM stream, DWORD mode, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->mode = mode)
+	STREAM_SETTER_APPLY(record->mode = mode, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetPosition(LPDIRECTSOUNDSTREAM stream, FLOAT x, FLOAT y, FLOAT z, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->position[0] = x; record->position[1] = y; record->position[2] = z)
+	STREAM_SETTER_APPLY(record->position[0] = x; record->position[1] = y; record->position[2] = z, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetVelocity(LPDIRECTSOUNDSTREAM stream, FLOAT x, FLOAT y, FLOAT z, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->velocity[0] = x; record->velocity[1] = y; record->velocity[2] = z)
+	STREAM_SETTER_APPLY(record->velocity[0] = x; record->velocity[1] = y; record->velocity[2] = z, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetMinDistance(LPDIRECTSOUNDSTREAM stream, FLOAT distance, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->minimum_distance = distance)
+	STREAM_SETTER_APPLY(record->minimum_distance = distance, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetMaxDistance(LPDIRECTSOUNDSTREAM stream, FLOAT distance, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->maximum_distance = distance)
+	STREAM_SETTER_APPLY(record->maximum_distance = distance, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetConeAngles(LPDIRECTSOUNDSTREAM stream, DWORD inside, DWORD outside, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->cone_inside = inside; record->cone_outside = outside)
+	STREAM_SETTER_APPLY(record->cone_inside = inside; record->cone_outside = outside, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetConeOrientation(LPDIRECTSOUNDSTREAM stream, FLOAT x, FLOAT y, FLOAT z, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->cone_orientation[0] = x; record->cone_orientation[1] = y; record->cone_orientation[2] = z)
+	STREAM_SETTER_APPLY(record->cone_orientation[0] = x; record->cone_orientation[1] = y; record->cone_orientation[2] = z, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetConeOutsideVolume(LPDIRECTSOUNDSTREAM stream, LONG volume, DWORD apply)
 {
-	(void)apply;
-	STREAM_SETTER(record->cone_outside_volume = volume)
+	STREAM_SETTER_APPLY(record->cone_outside_volume = volume, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_SetI3DL2Source(LPDIRECTSOUNDSTREAM stream, LPCDSI3DL2BUFFER source, DWORD apply)
 {
 	LONG direct, direct_hf;
-	(void)apply;
 	if (!source)
 		return DS_OK;
 
@@ -1316,24 +1444,12 @@ HRESULT WINAPI IDirectSoundStream_SetI3DL2Source(LPDIRECTSOUNDSTREAM stream, LPC
 	if (direct_hf > 0)
 		direct_hf = 0;
 
-	STREAM_SETTER({
+	STREAM_SETTER_APPLY({
 		record->i3dl2_gain = gain_from_millibels(direct);
-		if (al_active && record->source)
-		{
-			if (has_efx)
-			{
-				if (!record->has_direct_filter)
-				{
-					palGenFilters(1, &record->direct_filter);
-					palFilteri(record->direct_filter, AL_FILTER_TYPE, AL_FILTER_LOWPASS);
-					record->has_direct_filter = TRUE;
-				}
-				palFilterf(record->direct_filter, AL_LOWPASS_GAIN, gain_from_millibels(direct));
-				palFilterf(record->direct_filter, AL_LOWPASS_GAINHF, gain_from_millibels(direct_hf));
-				palSourcei(record->source, AL_DIRECT_FILTER, record->direct_filter);
-			}
-		}
-	})
+		record->filter_gain = gain_from_millibels(direct);
+		record->filter_gain_hf = gain_from_millibels(direct_hf);
+		record->filter_dirty = TRUE;
+	}, apply)
 }
 
 HRESULT WINAPI IDirectSoundStream_Pause(LPDIRECTSOUNDSTREAM stream, DWORD pause)

@@ -525,5 +525,9 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     # internet play's MQTT brokers, a file beside the game (network.brokers_file)
     brokers = BUILD / "brokers.txt"
     n.build(outputs=brokers, rule="windows_copy", inputs=Path("port/assets/network/brokers.txt"))
-    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, openal_dll, brokers])
+    alsoft_ini = BUILD / "alsoft.ini"
+    alsoft_src = Path("port/assets/audio/alsoft.ini")
+    if alsoft_src.is_file():
+        n.build(outputs=alsoft_ini, rule="windows_copy", inputs=alsoft_src)
+    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, openal_dll, brokers, alsoft_ini])
     n.newline()
