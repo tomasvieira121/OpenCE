@@ -180,6 +180,7 @@ struct al_stream {
   float velocity[3];
   float minimum_distance, maximum_distance;
   float i3dl2_gain;
+  float doppler_pitch;
 
   /* Cones */
   DWORD cone_inside, cone_outside;
@@ -229,6 +230,39 @@ static inline float clampf(float val, float min, float max) {
   if (val > max)
     return max;
   return val;
+}
+
+static float doppler_factor = 1.0f;
+
+static float compute_doppler_pitch(const struct al_stream *s) {
+  if (doppler_factor <= 0.0f || !s->has_3d || s->mode == DS3DMODE_DISABLE)
+    return 1.0f;
+
+  float c = 343.3f / (listener.distance_factor > 0.0f
+                          ? listener.distance_factor : 1.0f);
+  float lp[3] = {0}, lv[3] = {0};
+  if (s->mode != DS3DMODE_HEADRELATIVE) {
+    memcpy(lp, listener.position, sizeof(lp));
+    memcpy(lv, listener.velocity, sizeof(lv));
+  }
+
+  float rel[3] = { s->position[0]-lp[0], s->position[1]-lp[1],
+                   s->position[2]-lp[2] };
+  float d = sqrtf(rel[0]*rel[0] + rel[1]*rel[1] + rel[2]*rel[2]);
+  if (d < 1.0e-3f)
+    return 1.0f;
+
+  /* componentes ao longo da linha listener -> source */
+  float vs = (s->velocity[0]*rel[0] + s->velocity[1]*rel[1] +
+              s->velocity[2]*rel[2]) / d;
+  float vl = (lv[0]*rel[0] + lv[1]*rel[1] + lv[2]*rel[2]) / d;
+
+  float limit = 0.5f * c;
+  vs = clampf(vs * doppler_factor, -limit, limit);
+  vl = clampf(vl * doppler_factor, -limit, limit);
+
+  /* source a afastar-se (vs>0) => pitch desce; listener a aproximar => sobe */
+  return clampf((c + vl) / (c + vs), 0.5f, 2.0f);
 }
 
 static void normalize3(float *vector) {
@@ -347,11 +381,13 @@ static void update_source_properties(struct al_stream *stream) {
     float pitch =
         (float)(stream->frequency ? stream->frequency : stream->sample_rate) /
         (float)stream->sample_rate;
-    if (pitch < 0.01f)
-      pitch = 1.0f;
-    if (pitch > 2.0f)
-      pitch = 2.0f; /* Clamp max pitch to 2.0x to prevent physics-induced
-                       chipmunk sounds which starve the queue */
+
+    float target = compute_doppler_pitch(stream);
+    /* suavização: evita saltos bruscos por picos de velocidade */
+    stream->doppler_pitch += (target - stream->doppler_pitch) * 0.3f;
+
+    pitch *= stream->doppler_pitch;
+    pitch = clampf(pitch, 0.5f, 2.0f);
     palSourcef(stream->source, AL_PITCH, pitch);
   }
 
@@ -950,7 +986,7 @@ static HRESULT STDMETHODCALLTYPE stream_process(IDirectSoundStream *object,
     if (!stream->paused) {
       ALint state;
       palGetSourcei(stream->source, AL_SOURCE_STATE, &state);
-      if (state != AL_PLAYING)
+      if (state != AL_PLAYING && stream->packet_count >= 1)
         palSourcePlay(stream->source);
     }
   }
@@ -1202,6 +1238,10 @@ HRESULT WINAPI IDirectSound_CommitDeferredSettings(LPDIRECTSOUND sound) {
   (void)sound;
   pthread_mutex_lock(&stream_lock);
   if (al_active) {
+    if (listener.dirty_pos || listener.dirty_vel) {
+      for (struct al_stream *s = streams; s; s = s->next)
+        if (s->has_3d) s->dirty = TRUE;
+    }
     if (listener.dirty_pos) {
       palListener3f(AL_POSITION, listener.position[0], listener.position[1],
                     -listener.position[2]);
@@ -1286,6 +1326,19 @@ HRESULT WINAPI IDirectSound_SetDistanceFactor(LPDIRECTSOUND sound, FLOAT factor,
   listener.distance_factor = factor > 0.0f ? factor : 1.0f;
   if (al_active && palSpeedOfSound)
     palSpeedOfSound(343.3f / listener.distance_factor);
+  for (struct al_stream *s = streams; s; s = s->next)
+    if (s->has_3d) s->dirty = TRUE;
+  pthread_mutex_unlock(&stream_lock);
+  return DS_OK;
+}
+
+HRESULT WINAPI IDirectSound_SetDopplerFactor(LPDIRECTSOUND sound,
+                                             FLOAT factor, DWORD apply) {
+  (void)sound; (void)apply;
+  pthread_mutex_lock(&stream_lock);
+  doppler_factor = clampf(factor, 0.0f, 10.0f);
+  for (struct al_stream *s = streams; s; s = s->next)
+    if (s->has_3d) s->dirty = TRUE;
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
 }
@@ -1317,6 +1370,8 @@ HRESULT WINAPI IDirectSound_SetPosition(LPDIRECTSOUND sound, FLOAT x, FLOAT y,
     listener.dirty_pos = TRUE;
   } else if (al_active) {
     palListener3f(AL_POSITION, x, y, -z);
+    for (struct al_stream *s = streams; s; s = s->next)
+      if (s->has_3d) update_source_properties(s);
     listener.dirty_pos = FALSE;
   }
   pthread_mutex_unlock(&stream_lock);
@@ -1334,6 +1389,8 @@ HRESULT WINAPI IDirectSound_SetVelocity(LPDIRECTSOUND sound, FLOAT x, FLOAT y,
     listener.dirty_vel = TRUE;
   } else if (al_active) {
     palListener3f(AL_VELOCITY, x, y, -z);
+    for (struct al_stream *s = streams; s; s = s->next)
+      if (s->has_3d) update_source_properties(s);
     listener.dirty_vel = FALSE;
   }
   pthread_mutex_unlock(&stream_lock);
@@ -1396,6 +1453,7 @@ HRESULT WINAPI IDirectSound_CreateSoundStream(LPDIRECTSOUND sound,
   stream->minimum_distance = DS3D_DEFAULTMINDISTANCE;
   stream->maximum_distance = DS3D_DEFAULTMAXDISTANCE;
   stream->i3dl2_gain = 1.0f;
+  stream->doppler_pitch = 1.0f;
   stream->cone_inside = 360;
   stream->cone_outside = 360;
   stream->cone_outside_volume = 0; /* 0 mB = unity gain */
