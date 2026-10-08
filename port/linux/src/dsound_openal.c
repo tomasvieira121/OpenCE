@@ -1732,3 +1732,21 @@ HRESULT WINAPI IDirectSoundBuffer_SetVolume(LPDIRECTSOUNDBUFFER buffer,
   (void)volume;
   return DS_OK;
 }
+
+void dsound_openal_stream_set_stereo_position(IDirectSoundStream *object, BOOL positioned, float pan,
+                                           float distance, float minimum_distance, float distance_fade) {
+  struct al_stream *stream = (struct al_stream *)object;
+  (void)distance;
+  (void)minimum_distance;
+  (void)distance_fade;
+
+  pthread_mutex_lock(&stream_lock);
+  if (positioned && stream->channels == 2) {
+    stream->mix_left = pan < 0.0f ? 1.0f : 1.0f - pan;
+    stream->mix_right = pan > 0.0f ? 1.0f : 1.0f + pan;
+  } else {
+    stream->mix_left = 1.0f;
+    stream->mix_right = 1.0f;
+  }
+  pthread_mutex_unlock(&stream_lock);
+}
