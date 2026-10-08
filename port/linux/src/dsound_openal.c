@@ -252,17 +252,18 @@ static float compute_doppler_pitch(const struct al_stream *s) {
   if (d < 1.0e-3f)
     return 1.0f;
 
-  /* componentes ao longo da linha listener -> source */
+  /* components along the listener -> source line */
   float vs = (s->velocity[0]*rel[0] + s->velocity[1]*rel[1] +
               s->velocity[2]*rel[2]) / d;
   float vl = (lv[0]*rel[0] + lv[1]*rel[1] + lv[2]*rel[2]) / d;
 
-  float limit = 0.5f * c;
-  vs = clampf(vs * doppler_factor, -limit, limit);
-  vl = clampf(vl * doppler_factor, -limit, limit);
+  vs = clampf(vs * doppler_factor, -0.99f * c, 10.0f * c);
+  vl = clampf(vl * doppler_factor, -10.0f * c, 10.0f * c);
 
-  /* source a afastar-se (vs>0) => pitch desce; listener a aproximar => sobe */
-  return clampf((c + vl) / (c + vs), 0.5f, 2.0f);
+  /* source moving away (vs>0) => pitch drops; listener approaching => rises */
+  float denom = fmaxf(c + vs, 0.01f * c);
+  float ratio = (c + vl) / denom;
+  return clampf(ratio, 0.5f, 2.0f);
 }
 
 static void normalize3(float *vector) {
@@ -383,7 +384,7 @@ static void update_source_properties(struct al_stream *stream) {
         (float)stream->sample_rate;
 
     float target = compute_doppler_pitch(stream);
-    /* suavização: evita saltos bruscos por picos de velocidade */
+    /* smoothing: prevents sudden phase jumps (clipping) from engine velocity updates */
     stream->doppler_pitch += (target - stream->doppler_pitch) * 0.3f;
 
     pitch *= stream->doppler_pitch;
