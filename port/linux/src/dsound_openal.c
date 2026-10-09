@@ -174,6 +174,9 @@ struct al_stream {
   float mix_left, mix_right;
 
   /* 3D attributes */
+  BOOL stereo_positioned;
+  float stereo_pan;
+  float stereo_distance_fade;
   BOOL has_3d;
   DWORD mode;
   float position[3];
@@ -457,13 +460,18 @@ static void update_source_properties(struct al_stream *stream) {
       palSourcef(stream->source, AL_GAIN, gain);
     } else {
       /* Stereo voices (music, cutscenes) pass through directly without
-       * crossfeed or downmixing */
+       * crossfeed or downmixing unless positioned */
       if (has_direct_channels)
-        palSourcei(stream->source, AL_DIRECT_CHANNELS_SOFT, AL_TRUE);
+        palSourcei(stream->source, AL_DIRECT_CHANNELS_SOFT, stream->stereo_positioned ? AL_FALSE : AL_TRUE);
 
-      float gain = fmaxf(stream->mix_left, stream->mix_right) * stream->volume *
-                   mix_bin_headroom;
-      palSource3f(stream->source, AL_POSITION, 0.0f, 0.0f, 0.0f);
+      float gain = stream->volume * mix_bin_headroom;
+      if (stream->stereo_positioned) {
+        gain *= stream->stereo_distance_fade * stream->i3dl2_gain;
+        palSource3f(stream->source, AL_POSITION, stream->stereo_pan, 0.0f,
+                    -sqrtf(fmaxf(0.0f, 1.0f - stream->stereo_pan * stream->stereo_pan)));
+      } else {
+        palSource3f(stream->source, AL_POSITION, 0.0f, 0.0f, 0.0f);
+      }
       palSourcef(stream->source, AL_GAIN, gain);
     }
   }
@@ -1468,7 +1476,7 @@ HRESULT WINAPI IDirectSound_CreateSoundStream(LPDIRECTSOUND sound,
   pthread_mutex_lock(&stream_lock);
   if (al_active) {
     palGenSources(1, &stream->source);
-    if (has_efx && stream->has_3d && global_reverb_slot) {
+    if (has_efx && (stream->has_3d || stream->channels == 2) && global_reverb_slot) {
       palSource3i(stream->source, AL_AUXILIARY_SEND_FILTER, global_reverb_slot,
                   0, AL_FILTER_NULL);
     }
@@ -1738,15 +1746,17 @@ void dsound_openal_stream_set_stereo_position(IDirectSoundStream *object, BOOL p
   struct al_stream *stream = (struct al_stream *)object;
   (void)distance;
   (void)minimum_distance;
-  (void)distance_fade;
 
   pthread_mutex_lock(&stream_lock);
   if (positioned && stream->channels == 2) {
-    stream->mix_left = pan < 0.0f ? 1.0f : 1.0f - pan;
-    stream->mix_right = pan > 0.0f ? 1.0f : 1.0f + pan;
+    stream->stereo_positioned = TRUE;
+    stream->stereo_pan = pan < -1.0f ? -1.0f : (pan > 1.0f ? 1.0f : pan);
+    stream->stereo_distance_fade = distance_fade < 0.0f ? 0.0f : (distance_fade > 1.0f ? 1.0f : distance_fade);
   } else {
-    stream->mix_left = 1.0f;
-    stream->mix_right = 1.0f;
+    stream->stereo_positioned = FALSE;
+    stream->stereo_pan = 0.0f;
+    stream->stereo_distance_fade = 1.0f;
   }
+  update_source_properties(stream);
   pthread_mutex_unlock(&stream_lock);
 }
