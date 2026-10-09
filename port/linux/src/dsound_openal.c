@@ -184,6 +184,7 @@ struct al_stream {
   float minimum_distance, maximum_distance;
   float i3dl2_gain;
   float doppler_pitch;
+  uint64_t last_doppler_time;
 
   /* Cones */
   DWORD cone_inside, cone_outside;
@@ -267,6 +268,12 @@ static float compute_doppler_pitch(const struct al_stream *s) {
   float denom = fmaxf(c + vs, 0.01f * c);
   float ratio = (c + vl) / denom;
   return clampf(ratio, 0.5f, 2.0f);
+}
+
+static float smooth_doppler_pitch(float current, float target, float delta_time) {
+  const float smoothing_time = 0.05f; /* 50 ms */
+  float alpha = 1.0f - expf(-delta_time / smoothing_time);
+  return current + (target - current) * alpha;
 }
 
 static void normalize3(float *vector) {
@@ -387,8 +394,12 @@ static void update_source_properties(struct al_stream *stream) {
         (float)stream->sample_rate;
 
     float target = compute_doppler_pitch(stream);
-    /* smoothing: prevents sudden phase jumps (clipping) from engine velocity updates */
-    stream->doppler_pitch += (target - stream->doppler_pitch) * 0.3f;
+    
+    uint64_t current_time = SDL_GetTicks();
+    float delta_time = (stream->last_doppler_time == 0) ? 0.0f : (current_time - stream->last_doppler_time) / 1000.0f;
+    stream->last_doppler_time = current_time;
+
+    stream->doppler_pitch = smooth_doppler_pitch(stream->doppler_pitch, target, delta_time);
 
     pitch *= stream->doppler_pitch;
     pitch = clampf(pitch, 0.5f, 2.0f);
