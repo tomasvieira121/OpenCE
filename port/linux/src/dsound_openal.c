@@ -20,7 +20,7 @@ never freeze.
 #include "platform.h"
 #include "port_config.h"
 #include "sdl_platform.h"
-
+#include "voice_audio.h"
 
 #include <AL/al.h>
 #include <AL/alc.h>
@@ -127,6 +127,11 @@ static boolean has_source_spatialize = FALSE;
 static boolean has_direct_channels = FALSE;
 static ALuint global_reverb_effect = 0;
 static ALuint global_reverb_slot = 0;
+
+static ALuint voice_source = 0;
+static ALuint voice_buffers[3] = {0};
+static float voice_mix_buffer[VOICE_FRAME_SAMPLES * 2];
+static short voice_pcm_buffer[VOICE_FRAME_SAMPLES * 2];
 
 static float mix_bin_headroom = 1.0f;
 
@@ -570,6 +575,11 @@ static void *silent_clock_thread(void *argument) {
         i++;
       }
     }
+
+    /* Drain voice audio if OpenAL is inactive */
+    memset(voice_mix_buffer, 0, sizeof(voice_mix_buffer));
+    voice_audio_mix(voice_mix_buffer, VOICE_FRAME_SAMPLES);
+
     pthread_mutex_unlock(&stream_lock);
   }
   return NULL;
@@ -809,6 +819,22 @@ static void audio_start(void) {
                               global_reverb_effect);
       platform_log("OpenAL EFX: environmental reverb and filters initialized");
     }
+  }
+
+  /* Initialize Voice Chat Source */
+  if (al_active) {
+    palGenSources(1, &voice_source);
+    palSourcei(voice_source, AL_SOURCE_RELATIVE, AL_TRUE);
+    palSource3f(voice_source, AL_POSITION, 0.0f, 0.0f, 0.0f);
+    palSourcef(voice_source, AL_ROLLOFF_FACTOR, 0.0f);
+    
+    palGenBuffers(3, voice_buffers);
+    for (int i = 0; i < 3; i++) {
+      memset(voice_pcm_buffer, 0, sizeof(voice_pcm_buffer));
+      palBufferData(voice_buffers[i], AL_FORMAT_STEREO16, voice_pcm_buffer, sizeof(voice_pcm_buffer), 48000);
+    }
+    palSourceQueueBuffers(voice_source, 3, voice_buffers);
+    palSourcePlay(voice_source);
   }
 }
 
@@ -1070,6 +1096,13 @@ ULONG WINAPI IDirectSound_Release(LPDIRECTSOUND sound) {
     if (direct_sound.reference_count == 0 && al_active) {
       pthread_mutex_lock(&stream_lock);
       al_active = FALSE;
+      if (voice_source) {
+        palSourceStop(voice_source);
+        palSourcei(voice_source, AL_BUFFER, 0);
+        palDeleteBuffers(3, voice_buffers);
+        palDeleteSources(1, &voice_source);
+        voice_source = 0;
+      }
       if (has_efx) {
         if (global_reverb_slot) {
           palAuxiliaryEffectSloti(global_reverb_slot, AL_EFFECTSLOT_EFFECT,
@@ -1219,6 +1252,33 @@ VOID WINAPI DirectSoundDoWork(void) {
 
     current = current->next;
   }
+
+  /* Voice Chat Streaming */
+  if (al_active && voice_source) {
+    ALint processed = 0;
+    palGetSourcei(voice_source, AL_BUFFERS_PROCESSED, &processed);
+    while (processed > 0) {
+      ALuint buffer;
+      palSourceUnqueueBuffers(voice_source, 1, &buffer);
+      memset(voice_mix_buffer, 0, sizeof(voice_mix_buffer));
+      voice_audio_mix(voice_mix_buffer, VOICE_FRAME_SAMPLES);
+      for (int i = 0; i < VOICE_FRAME_SAMPLES * 2; i++) {
+        float sample = voice_mix_buffer[i];
+        if (sample > 1.0f) sample = 1.0f;
+        else if (sample < -1.0f) sample = -1.0f;
+        voice_pcm_buffer[i] = (short)(sample * 32767.0f);
+      }
+      palBufferData(buffer, AL_FORMAT_STEREO16, voice_pcm_buffer, sizeof(voice_pcm_buffer), 48000);
+      palSourceQueueBuffers(voice_source, 1, &buffer);
+      processed--;
+    }
+    ALint state;
+    palGetSourcei(voice_source, AL_SOURCE_STATE, &state);
+    if (state != AL_PLAYING) {
+      palSourcePlay(voice_source);
+    }
+  }
+
   pthread_mutex_unlock(&stream_lock);
 }
 
