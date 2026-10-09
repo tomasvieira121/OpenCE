@@ -220,6 +220,8 @@ static struct {
 static DSI3DL2LISTENER cached_i3dl2_listener;
 static BOOL i3dl2_listener_dirty = FALSE;
 
+static void apply_i3dl2_listener_locked(const DSI3DL2LISTENER *props);
+
 static float master_volume = 1.0f;
 
 static float gain_from_millibels(LONG millibels) {
@@ -551,20 +553,21 @@ static void *silent_clock_thread(void *argument) {
                     0.01;
       stream->cursor += step;
 
-      while (1) {
-        struct voice_packet *packet = NULL;
-        for (unsigned long i = 0; i < stream->packet_count; i++) {
-          struct voice_packet *p = &stream->packets[(stream->packet_head + i) %
-                                                    MAXIMUM_STREAM_PACKETS];
-          if (!p->finished) {
-            packet = p;
+      /* Find the finished packets sequentially. Do not scan from the beginning each time. */
+      unsigned long i = 0;
+      while (i < stream->packet_count) {
+        struct voice_packet *packet = &stream->packets[(stream->packet_head + i) %
+                                                       MAXIMUM_STREAM_PACKETS];
+        if (!packet->finished) {
+          if (stream->cursor >= (double)packet->frames) {
+            stream->cursor -= (double)packet->frames;
+            packet->finished = TRUE;
+          } else {
+            /* Stop the search. This packet is not finished. */
             break;
           }
         }
-        if (!packet || stream->cursor < (double)packet->frames)
-          break;
-        stream->cursor -= (double)packet->frames;
-        packet->finished = TRUE;
+        i++;
       }
     }
     pthread_mutex_unlock(&stream_lock);
@@ -1111,8 +1114,37 @@ VOID WINAPI DirectSoundDoWork(void) {
   }
 
   pthread_mutex_lock(&stream_lock);
+  
+  /* Apply the deferred listener properties to OpenAL. */
+  if (al_active) {
+    if (listener.dirty_pos) {
+      palListener3f(AL_POSITION, listener.position[0], listener.position[1], -listener.position[2]);
+      listener.dirty_pos = FALSE;
+    }
+    if (listener.dirty_vel) {
+      palListener3f(AL_VELOCITY, listener.velocity[0], listener.velocity[1], -listener.velocity[2]);
+      listener.dirty_vel = FALSE;
+    }
+    if (listener.dirty_ori) {
+      ALfloat orientation[6] = {listener.front[0],  listener.front[1], -listener.front[2],
+                                listener.top[0],    listener.top[1],   -listener.top[2]};
+      palListenerfv(AL_ORIENTATION, orientation);
+      listener.dirty_ori = FALSE;
+    }
+    if (i3dl2_listener_dirty) {
+      apply_i3dl2_listener_locked(&cached_i3dl2_listener);
+      i3dl2_listener_dirty = FALSE;
+    }
+  }
+
   struct al_stream *current = streams;
   while (current) {
+    /* Apply the deferred stream properties. */
+    if (al_active && current->dirty) {
+      update_source_properties(current);
+      current->dirty = FALSE;
+    }
+
     BOOL did_work = FALSE;
 
     if (al_active && current->source) {
@@ -1366,14 +1398,13 @@ HRESULT WINAPI IDirectSound_SetDopplerFactor(LPDIRECTSOUND sound,
 HRESULT WINAPI IDirectSound_SetRolloffFactor(LPDIRECTSOUND sound, FLOAT factor,
                                              DWORD apply) {
   (void)sound;
+  (void)apply;
+  
+  /* Lock the data. Change the rolloff factor. Mark the streams as dirty to do the update later. */
   pthread_mutex_lock(&stream_lock);
   listener.rolloff_factor = factor >= 0.0f ? factor : 1.0f;
-  if (apply == DS3D_DEFERRED) {
-    for (struct al_stream *stream = streams; stream; stream = stream->next)
-      stream->dirty = TRUE;
-  } else if (al_active) {
-    for (struct al_stream *stream = streams; stream; stream = stream->next)
-      update_source_properties(stream);
+  for (struct al_stream *stream = streams; stream; stream = stream->next) {
+    stream->dirty = TRUE;
   }
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
@@ -1382,18 +1413,14 @@ HRESULT WINAPI IDirectSound_SetRolloffFactor(LPDIRECTSOUND sound, FLOAT factor,
 HRESULT WINAPI IDirectSound_SetPosition(LPDIRECTSOUND sound, FLOAT x, FLOAT y,
                                         FLOAT z, DWORD apply) {
   (void)sound;
+  (void)apply;
+  
+  /* Lock the data. Change the position. Mark the listener as dirty to do the update later. */
   pthread_mutex_lock(&stream_lock);
   listener.position[0] = x;
   listener.position[1] = y;
   listener.position[2] = z;
-  if (apply == DS3D_DEFERRED) {
-    listener.dirty_pos = TRUE;
-  } else if (al_active) {
-    palListener3f(AL_POSITION, x, y, -z);
-    for (struct al_stream *s = streams; s; s = s->next)
-      if (s->has_3d) update_source_properties(s);
-    listener.dirty_pos = FALSE;
-  }
+  listener.dirty_pos = TRUE;
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
 }
@@ -1401,18 +1428,14 @@ HRESULT WINAPI IDirectSound_SetPosition(LPDIRECTSOUND sound, FLOAT x, FLOAT y,
 HRESULT WINAPI IDirectSound_SetVelocity(LPDIRECTSOUND sound, FLOAT x, FLOAT y,
                                         FLOAT z, DWORD apply) {
   (void)sound;
+  (void)apply;
+  
+  /* Lock the data. Change the velocity. Mark the listener as dirty to do the update later. */
   pthread_mutex_lock(&stream_lock);
   listener.velocity[0] = x;
   listener.velocity[1] = y;
   listener.velocity[2] = z;
-  if (apply == DS3D_DEFERRED) {
-    listener.dirty_vel = TRUE;
-  } else if (al_active) {
-    palListener3f(AL_VELOCITY, x, y, -z);
-    for (struct al_stream *s = streams; s; s = s->next)
-      if (s->has_3d) update_source_properties(s);
-    listener.dirty_vel = FALSE;
-  }
+  listener.dirty_vel = TRUE;
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
 }
@@ -1422,6 +1445,9 @@ HRESULT WINAPI IDirectSound_SetOrientation(LPDIRECTSOUND sound, FLOAT x_front,
                                            FLOAT x_top, FLOAT y_top,
                                            FLOAT z_top, DWORD apply) {
   (void)sound;
+  (void)apply;
+  
+  /* Lock the data. Change the orientation. Normalize the vectors. Mark the listener as dirty. */
   pthread_mutex_lock(&stream_lock);
   listener.front[0] = x_front;
   listener.front[1] = y_front;
@@ -1431,16 +1457,8 @@ HRESULT WINAPI IDirectSound_SetOrientation(LPDIRECTSOUND sound, FLOAT x_front,
   listener.top[2] = z_top;
   normalize3(listener.front);
   normalize3(listener.top);
-
-  if (apply == DS3D_DEFERRED) {
-    listener.dirty_ori = TRUE;
-  } else if (al_active) {
-    ALfloat orientation[6] = {listener.front[0],  listener.front[1],
-                              -listener.front[2], listener.top[0],
-                              listener.top[1],    -listener.top[2]};
-    palListenerfv(AL_ORIENTATION, orientation);
-    listener.dirty_ori = FALSE;
-  }
+  
+  listener.dirty_ori = TRUE;
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
 }
@@ -1517,22 +1535,19 @@ DirectSoundGetStreamVoiceStatus(LPDIRECTSOUNDSTREAM stream) {
 
 #define STREAM_SETTER(body)                                                    \
   struct al_stream *record = stream_from_interface(stream);                    \
+  /* Set the parameters. Mark the stream as dirty to do the update later. */   \
   pthread_mutex_lock(&stream_lock);                                            \
   body;                                                                        \
-  update_source_properties(record);                                            \
+  record->dirty = TRUE;                                                        \
   pthread_mutex_unlock(&stream_lock);                                          \
   return DS_OK;
 
 #define STREAM_SETTER_APPLY(body, apply)                                       \
   struct al_stream *record = stream_from_interface(stream);                    \
+  /* Set the parameters. Mark the stream as dirty to do the update later. */   \
   pthread_mutex_lock(&stream_lock);                                            \
   body;                                                                        \
-  if ((apply) == DS3D_DEFERRED)                                                \
-    record->dirty = TRUE;                                                      \
-  else {                                                                       \
-    update_source_properties(record);                                          \
-    record->dirty = FALSE;                                                     \
-  }                                                                            \
+  record->dirty = TRUE;                                                        \
   pthread_mutex_unlock(&stream_lock);                                          \
   return DS_OK;
 
@@ -1559,6 +1574,7 @@ HRESULT WINAPI IDirectSoundStream_SetMixBinVolumes(LPDIRECTSOUNDSTREAM stream,
   unsigned long bit, index = 0;
 
   pthread_mutex_lock(&stream_lock);
+  /* Set the volumes. Mark the stream as dirty to do the update later. */
   for (bit = 0; bit < 32; bit++) {
     if (!(mix_bin_mask & (1UL << bit)))
       continue;
@@ -1568,7 +1584,7 @@ HRESULT WINAPI IDirectSoundStream_SetMixBinVolumes(LPDIRECTSOUNDSTREAM stream,
       record->mix_right = gain_from_millibels(volumes[index]);
     index++;
   }
-  update_source_properties(record);
+  record->dirty = TRUE;
   pthread_mutex_unlock(&stream_lock);
   return DS_OK;
 }
