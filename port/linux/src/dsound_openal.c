@@ -522,6 +522,10 @@ static void stream_complete_head(struct al_stream *stream, DWORD status,
   }
   free(entry->samples);
   entry->samples = NULL;
+  
+  if (!entry->finished)
+    stream->cursor = 0.0;
+    
   entry->finished = FALSE;
 
   stream->packet_head = (stream->packet_head + 1) % MAXIMUM_STREAM_PACKETS;
