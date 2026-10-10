@@ -37,7 +37,7 @@ never freeze.
 #include <unistd.h>
 
 
-#define MAXIMUM_STREAM_PACKETS 64
+#define MAXIMUM_STREAM_PACKETS 256
 #define XBOX_ADPCM_BLOCK_BYTES 36
 #define XBOX_ADPCM_BLOCK_SAMPLES 64
 
@@ -457,7 +457,7 @@ static void update_source_properties(struct al_stream *stream) {
     /* 2D voice: do not apply HRTF spatialization to non-diegetic sounds (UI,
      * HUD, dialogue) */
     if (has_source_spatialize)
-      palSourcei(stream->source, AL_SOURCE_SPATIALIZE_SOFT, AL_TRUE);
+      palSourcei(stream->source, AL_SOURCE_SPATIALIZE_SOFT, AL_FALSE);
 
     palSourcei(stream->source, AL_SOURCE_RELATIVE, AL_TRUE);
     palSourcef(stream->source, AL_ROLLOFF_FACTOR, 0.0f);
@@ -484,7 +484,7 @@ static void update_source_properties(struct al_stream *stream) {
 
       float gain = stream->volume * mix_bin_headroom;
       if (stream->stereo_positioned) {
-        gain *= stream->stereo_distance_fade * stream->i3dl2_gain;
+        gain *= stream->i3dl2_gain;
         palSource3f(stream->source, AL_POSITION, stream->stereo_pan, 0.0f,
                     -sqrtf(fmaxf(0.0f, 1.0f - stream->stereo_pan * stream->stereo_pan)));
       } else {
